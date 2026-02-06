@@ -1,1 +1,298 @@
+#include <ESP8266WiFi.h>
+#include <ESP8266WebServer.h>
 
+/* ================== SENSOR & ALERT ================== */
+#define SENSOR_PIN A0
+#define GREEN_LED  D6
+#define ALERT_PIN  D7
+
+/* ================== MOTOR (SINGLE MOTOR) ================== */
+#define IN1 D1
+#define IN2 D2
+#define ENA D5
+
+int threshold = 500;
+int waterLevel = 0;
+
+/* ================== BUZZER ================== */
+bool emergencyBuzzer = false;
+bool dangerBuzzerState = false;
+
+/* ================== MOTOR CONTROL ================== */
+bool floodDetected = false;
+bool evacuationActive = false;
+
+bool motorMoving = false;
+bool pauseActive = false;
+bool motorDirection = true; // true = forward
+int evacuationCount = 0;
+
+unsigned long motorTimer = 0;
+unsigned long pauseTimer = 0;
+unsigned long floodDelayTimer = 0;
+
+const unsigned long FLOOD_DELAY = 5000;
+const unsigned long RUN_TIME = 3000;
+const unsigned long PAUSE_TIME = 3000;
+const int MAX_CYCLES = 3;
+
+/* ================== WIFI ================== */
+const char* ssid = "FloodGuard-ESP";
+const char* password = "12345678";
+
+ESP8266WebServer server(80);
+
+/* ================== TIMERS ================== */
+unsigned long lastWaterRead = 0;
+unsigned long lastBuzzerToggle = 0;
+
+/* ================== HTML ================== */
+String webpage() {
+  return R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>FloodGuard Dashboard</title>
+<style>
+body{
+  margin:0;
+  font-family:Segoe UI;
+  background:radial-gradient(circle at top,#0f172a,#020617);
+  color:white;
+  text-align:center;
+}
+.container{
+  background:rgba(15,23,42,.9);
+  margin:12px auto;
+  padding:16px;
+  width:92%;
+  max-width:480px;
+  border-radius:14px;
+  box-shadow:0 0 25px rgba(56,189,248,.15);
+}
+canvas{width:100%;height:220px;}
+.alert{
+  font-size:1.2em;
+  color:#ef4444;
+  animation:pulse 1s infinite;
+}
+button{
+  margin:6px;
+  padding:12px 18px;
+  border-radius:10px;
+  border:none;
+  font-weight:bold;
+  cursor:pointer;
+}
+.buzzer{background:#ef4444;color:white;}
+.evacuate{background:#facc15;color:black;}
+@keyframes pulse{50%{opacity:.4}}
+</style>
+</head>
+
+<body>
+<h2>🌊 FloodGuard Command Center</h2>
+
+<div id="alertText" class="container">STATUS: SAFE</div>
+
+<div class="container">
+<canvas id="liveChart"></canvas>
+</div>
+
+<button class="buzzer" onclick="fetch('/emergency')">EMERGENCY BUZZER</button>
+<button class="evacuate" onclick="fetch('/evacuate')">EMERGENCY EVACUATION</button>
+
+<div class="container">
+<h3>⚠ Flood History</h3>
+<canvas id="history"></canvas>
+</div>
+
+<div class="container">
+<h3>📈 Flood Prediction Pattern</h3>
+<canvas id="predict"></canvas>
+</div>
+
+<script>
+const lc=document.getElementById("liveChart").getContext("2d");
+const hc=document.getElementById("history").getContext("2d");
+const pc=document.getElementById("predict").getContext("2d");
+
+let data=[],hist=[],pred=[200,300,450,600,520,650];
+
+setInterval(()=>{
+ fetch("/data").then(r=>r.json()).then(d=>{
+  data.push(d.level); if(data.length>20)data.shift();
+  hist.push(d.level>=d.threshold?1:0); if(hist.length>30)hist.shift();
+
+  lc.clearRect(0,0,380,220);
+  lc.strokeStyle="#38bdf8"; lc.beginPath();
+  data.forEach((v,i)=>{
+    let x=20+i*18, y=200-(v/1023)*180;
+    i?lc.lineTo(x,y):lc.moveTo(x,y);
+  }); lc.stroke();
+
+  hc.clearRect(0,0,380,220);
+  hist.forEach((v,i)=>{
+    hc.fillStyle=v?"#ef4444":"#22c55e";
+    hc.fillRect(20+i*10,40,8,160);
+  });
+
+  pc.clearRect(0,0,380,220);
+  pc.strokeStyle="#facc15"; pc.beginPath();
+  pred.forEach((v,i)=>{
+    let x=20+i*50, y=200-(v/1023)*180;
+    i?pc.lineTo(x,y):pc.moveTo(x,y);
+  }); pc.stroke();
+
+  document.getElementById("alertText").innerHTML=
+   d.level>=d.threshold?
+   "<div class='alert'>🚨 FLOOD DETECTED — EVACUATE PREMISES 🚨</div>":
+   "STATUS: SAFE";
+ });
+},1000);
+</script>
+</body>
+</html>
+)rawliteral";
+}
+
+/* ================== SETUP ================== */
+void setup(){
+  Serial.begin(115200);
+  Serial.println("\n=== FloodGuard System Booting ===");
+
+  pinMode(GREEN_LED,OUTPUT);
+  pinMode(ALERT_PIN,OUTPUT);
+  pinMode(IN1,OUTPUT);
+  pinMode(IN2,OUTPUT);
+  pinMode(ENA,OUTPUT);
+
+  WiFi.softAP(ssid,password);
+  Serial.println("WiFi Access Point Started");
+  Serial.print("Dashboard IP Address: ");
+  Serial.println(WiFi.softAPIP());
+
+  server.on("/",[](){server.send(200,"text/html",webpage());});
+  server.on("/data",[](){
+    server.send(200,"application/json",
+    "{\"level\":"+String(waterLevel)+",\"threshold\":"+String(threshold)+"}");
+  });
+
+  server.on("/emergency",[](){
+    emergencyBuzzer=!emergencyBuzzer;
+    Serial.println(emergencyBuzzer ? "Emergency buzzer ACTIVATED" : "Emergency buzzer DEACTIVATED");
+    digitalWrite(ALERT_PIN,emergencyBuzzer);
+    server.send(200,"text/plain","OK");
+  });
+
+  server.on("/evacuate",[](){
+    Serial.println("Manual evacuation triggered from dashboard");
+    evacuationActive=true;
+    evacuationCount=0;
+    motorDirection=true;
+    motorMoving=false;
+    pauseActive=false;
+    floodDelayTimer=millis();
+    server.send(200,"text/plain","EVACUATION STARTED");
+  });
+
+  server.begin();
+  Serial.println("Web server started");
+}
+
+/* ================== LOOP ================== */
+void loop(){
+  unsigned long now=millis();
+
+  if(now-lastWaterRead>=1000){
+    lastWaterRead=now;
+    waterLevel=analogRead(SENSOR_PIN);
+    Serial.print("Water Level: ");
+    Serial.println(waterLevel);
+  }
+
+  if(!emergencyBuzzer && waterLevel>=threshold){
+    if(now-lastBuzzerToggle>=500){
+      lastBuzzerToggle=now;
+      dangerBuzzerState=!dangerBuzzerState;
+      digitalWrite(ALERT_PIN,dangerBuzzerState);
+      digitalWrite(GREEN_LED,LOW);
+    }
+  }else{
+    digitalWrite(ALERT_PIN,emergencyBuzzer);
+    digitalWrite(GREEN_LED,waterLevel<threshold);
+  }
+
+  if(waterLevel>=threshold && !floodDetected){
+    floodDetected=true;
+    evacuationActive=true;
+    evacuationCount=0;
+    motorDirection=true;
+    motorMoving=false;
+    pauseActive=false;
+    floodDelayTimer=now;
+    Serial.println("⚠ Flood detected — evacuation sequence initialized");
+  }
+
+  /* ===== MOTOR STATE MACHINE ===== */
+  if(evacuationActive && evacuationCount < MAX_CYCLES){
+    if(now - floodDelayTimer >= FLOOD_DELAY){
+
+      if(pauseActive){
+        if(now - pauseTimer >= PAUSE_TIME){
+          pauseActive=false;
+          motorMoving=false;
+          motorTimer=now;
+          Serial.println("Pause complete");
+        }
+      }
+
+      else if(!motorMoving){
+        motorMoving=true;
+        motorTimer=now;
+
+        if(motorDirection){
+          Serial.println("Motor FORWARD (3s)");
+          digitalWrite(IN1,HIGH);
+          digitalWrite(IN2,LOW);
+        }else{
+          Serial.print("Motor BACKWARD (3s) — Cycle ");
+          Serial.println(evacuationCount + 1);
+          digitalWrite(IN1,LOW);
+          digitalWrite(IN2,HIGH);
+        }
+        analogWrite(ENA,200);
+      }
+
+      else if(now - motorTimer >= RUN_TIME){
+        digitalWrite(IN1,LOW);
+        digitalWrite(IN2,LOW);
+        analogWrite(ENA,0);
+
+        pauseActive=true;
+        pauseTimer=now;
+
+        if(!motorDirection){
+          evacuationCount++;
+        }
+
+        motorDirection=!motorDirection;
+        motorMoving=false;
+        Serial.println("Motor stopped — entering pause");
+      }
+    }
+  }
+
+  if(evacuationActive && evacuationCount >= MAX_CYCLES){
+    evacuationActive=false;
+    Serial.println("Evacuation complete — motor stopped");
+  }
+
+  if(waterLevel<threshold && floodDetected){
+    floodDetected=false;
+    Serial.println("Water level normalized — system reset");
+  }
+
+  server.handleClient();
+}
